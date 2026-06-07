@@ -1,0 +1,30 @@
+name: {{.Name}}
+
+apps:
+  api:
+    path: apps/api
+    main: ./cmd/api
+    port: 8080
+    env: .env
+  worker:
+    path: apps/worker
+    main: ./cmd/worker
+
+libs:
+  auth:
+    path: libs/auth
+  config:
+    path: libs/config
+  database:
+    path: libs/database
+
+tasks:
+  dev:
+    - run: api
+    - run: worker
+
+release:
+  targets:
+    - windows/amd64
+    - linux/amd64
+    - darwin/arm64
