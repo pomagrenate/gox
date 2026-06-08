@@ -62,6 +62,23 @@ var doctorCmd = &cobra.Command{
 			}
 		}
 
+		// 4. Security Audit (govulncheck)
+		fmt.Println("\nRunning Security Audit...")
+		_, err = exec.LookPath("govulncheck")
+		if err != nil {
+			fmt.Println("⚠️  'govulncheck' not found in PATH. Skipping security audit.")
+			fmt.Println("   (Tip: install it via 'go install golang.org/x/vuln/cmd/govulncheck@latest')")
+		} else {
+			vulnCmd := exec.Command("govulncheck", "./...")
+			vulnCmd.Dir = workspaceRoot
+			if err := vulnCmd.Run(); err != nil {
+				fmt.Println("❌ Vulnerabilities found! Run 'govulncheck ./...' for details.")
+				issues++
+			} else {
+				fmt.Println("✅ No known vulnerabilities found.")
+			}
+		}
+
 		fmt.Println("\n--- Summary ---")
 		if issues == 0 {
 			fmt.Println("🎉 Everything looks good! You are ready to go.")
