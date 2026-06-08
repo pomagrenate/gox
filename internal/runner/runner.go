@@ -5,14 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
+	"time"
 
 	"gox/internal/config"
+	"gox/internal/proxy"
+	"gox/internal/watcher"
 )
 
 var colors = []string{
@@ -45,9 +48,8 @@ func (r *Runner) RunDev() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt)
 	go func() {
 		<-sigCh
 		fmt.Println("\nReceived interrupt, shutting down gracefully...")
@@ -71,7 +73,7 @@ func (r *Runner) RunDev() error {
 		wg.Add(1)
 		go func(name string, app config.App, col string) {
 			defer wg.Done()
-			r.runProcess(ctx, name, app, col)
+			r.runAppWithLiveReload(ctx, name, app, col)
 		}(appName, app, color)
 	}
 
@@ -80,57 +82,106 @@ func (r *Runner) RunDev() error {
 	return nil
 }
 
-func (r *Runner) runProcess(ctx context.Context, name string, app config.App, color string) {
+func (r *Runner) runAppWithLiveReload(ctx context.Context, name string, app config.App, color string) {
 	appDir := filepath.Join(r.ProjectRoot, app.Path)
-	mainPath := app.Main
-	if mainPath == "" {
-		mainPath = "."
-	}
 
-	cmd := exec.CommandContext(ctx, "go", "run", mainPath)
-	cmd.Dir = appDir
-
-	// Setup environment variables if needed
-	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%s", app.Port))
-
-	stdout, err := cmd.StdoutPipe()
+	// Start File Watcher
+	w, err := watcher.NewWatcher(appDir)
 	if err != nil {
-		fmt.Printf("[%s] Error setting up stdout: %v\n", name, err)
+		fmt.Printf("[%s] Error starting watcher: %v\n", name, err)
 		return
 	}
+	defer w.Close()
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		fmt.Printf("[%s] Error setting up stderr: %v\n", name, err)
-		return
+	// Start Proxy Server
+	proxyPort := app.Port
+	if proxyPort == "" {
+		proxyPort = "8080"
 	}
 
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("[%s] Failed to start: %v\n", name, err)
-		return
+	dp := proxy.NewDynamicProxy()
+	proxyServer := &http.Server{
+		Addr:    ":" + proxyPort,
+		Handler: dp,
 	}
 
-	prefix := fmt.Sprintf("%s[%s]%s ", color, name, resetColor)
-	fmt.Printf("%sStarted (PID: %d)\n", prefix, cmd.Process.Pid)
-
-	var streamWg sync.WaitGroup
-	streamWg.Add(2)
-
-	go r.streamLogs(stdout, prefix, &streamWg)
-	go r.streamLogs(stderr, prefix, &streamWg)
-
-	streamWg.Wait()
-
-	err = cmd.Wait()
-	if err != nil {
-		if ctx.Err() != nil {
-			fmt.Printf("%sStopped\n", prefix)
-		} else {
-			fmt.Printf("%sExited with error: %v\n", prefix, err)
+	go func() {
+		fmt.Printf("%s[%s]%s Reverse Proxy listening on :%s\n", color, name, resetColor, proxyPort)
+		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("[%s] Proxy error: %v\n", name, err)
 		}
-	} else {
-		fmt.Printf("%sExited cleanly\n", prefix)
+	}()
+	defer proxyServer.Close()
+
+	var currentCmd *exec.Cmd
+	backendPort := 35000 // Starting dynamic port
+
+	buildAndSwap := func() {
+		backendPort++
+		fmt.Printf("%s[%s]%s Building new version...\n", color, name, resetColor)
+
+		binPath := filepath.Join(r.ProjectRoot, "bin", fmt.Sprintf("%s_tmp.exe", name))
+		mainPath := app.Main
+		if mainPath == "" {
+			mainPath = "."
+		}
+
+		buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, mainPath)
+		buildCmd.Dir = appDir
+		if out, err := buildCmd.CombinedOutput(); err != nil {
+			fmt.Printf("%s[%s]%s Build failed: %v\n%s\n", color, name, resetColor, err, string(out))
+			return
+		}
+
+		runCmd := exec.CommandContext(ctx, binPath)
+		runCmd.Dir = appDir
+		runCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", backendPort))
+
+		stdout, _ := runCmd.StdoutPipe()
+		stderr, _ := runCmd.StderrPipe()
+
+		if err := runCmd.Start(); err != nil {
+			fmt.Printf("%s[%s]%s Failed to start: %v\n", color, name, resetColor, err)
+			return
+		}
+
+		var streamWg sync.WaitGroup
+		streamWg.Add(2)
+		prefix := fmt.Sprintf("%s[%s:%d]%s ", color, name, backendPort, resetColor)
+		go r.streamLogs(stdout, prefix, &streamWg)
+		go r.streamLogs(stderr, prefix, &streamWg)
+
+		// Give the new process a moment to bind to the port
+		time.Sleep(500 * time.Millisecond)
+
+		err = dp.SetTarget(fmt.Sprintf("http://127.0.0.1:%d", backendPort))
+		if err != nil {
+			fmt.Printf("%s[%s]%s Failed to set proxy target: %v\n", color, name, resetColor, err)
+			return
+		}
+		fmt.Printf("%s[%s]%s Live Reload Complete! Traffic switched to port %d\n", color, name, resetColor, backendPort)
+
+		if currentCmd != nil && currentCmd.Process != nil {
+			fmt.Printf("%s[%s]%s Initiating graceful shutdown of old process (PID: %d)...\n", color, name, resetColor, currentCmd.Process.Pid)
+			// Terminate gracefully using interrupt
+			currentCmd.Process.Signal(os.Interrupt)
+		}
+
+		currentCmd = runCmd
+	}
+
+	buildAndSwap()
+
+	for {
+		select {
+		case <-ctx.Done():
+			if currentCmd != nil && currentCmd.Process != nil {
+				currentCmd.Process.Kill()
+			}
+			return
+		case <-w.OnChange:
+			buildAndSwap()
+		}
 	}
 }
 

@@ -1,0 +1,11 @@
+name: gox-framework-dev
+
+apps:
+  api:
+    path: example/zero-boilerplate
+    main: main.go
+    port: 8080
+
+tasks:
+  dev:
+    - run: api
